@@ -1,6 +1,5 @@
 praw
 requests
-time
-threads
 flask
+python-dotenv
 
