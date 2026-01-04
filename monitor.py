@@ -1,9 +1,9 @@
 import os
-import time
 import threading
 import requests
 import praw
 from flask import Flask
+from datetime import datetime, timezone, timedelta
 
 # --- Load environment variables ---
 REDDIT_CLIENT_ID = os.getenv("REDDIT_CLIENT_ID")
@@ -20,25 +20,31 @@ reddit = praw.Reddit(
 )
 subreddit = reddit.subreddit("plsdonategame")
 TARGET_FLAIRS = {"Free Giveaway", "Requirement Giveaway"}
-seen_posts = set()
 
 def send_to_discord(submission):
     post_url = f"https://reddit.com{submission.permalink}"
     ping = f"<@{DISCORD_PING_USER_ID}> " if DISCORD_PING_USER_ID else ""
     data = {"content": f"{ping}🎉 New giveaway!\n**{submission.title}**\n{post_url}"}
     r = requests.post(DISCORD_WEBHOOK_URL, json=data)
-    print("Discord response:", r.status_code)
+    print("Sent:", submission.title, "| Discord response:", r.status_code)
 
-def reddit_loop():
-    print("Bot started. Monitoring r/plsdonategame...")
-    while True:
-        for submission in subreddit.new(limit=5):
-            if submission.id not in seen_posts and submission.link_flair_text in TARGET_FLAIRS:
-                seen_posts.add(submission.id)
-                send_to_discord(submission)
-        time.sleep(30)
+def catch_recent_posts():
+    """Check subreddit for posts in the last 24h with target flair."""
+    print("Checking for posts from the last 24 hours...")
+    cutoff = datetime.now(timezone.utc) - timedelta(days=1)
+    for submission in subreddit.new(limit=50):  # look at latest 50
+        created = datetime.fromtimestamp(submission.created_utc, tz=timezone.utc)
+        if created > cutoff and submission.link_flair_text in TARGET_FLAIRS:
+            send_to_discord(submission)
 
-# --- Flask app to keep Render happy ---
+def reddit_stream():
+    """Stream new posts continuously."""
+    print("Streaming new posts...")
+    for submission in subreddit.stream.submissions(skip_existing=True):
+        if submission.link_flair_text in TARGET_FLAIRS:
+            send_to_discord(submission)
+
+# --- Flask app to keep Render alive ---
 app = Flask(__name__)
 
 @app.route("/")
@@ -46,8 +52,10 @@ def home():
     return "Bot is running!"
 
 if __name__ == "__main__":
-    # Start Reddit loop in background thread
-    threading.Thread(target=reddit_loop, daemon=True).start()
+    # First, catch posts from last 24h
+    catch_recent_posts()
+    # Then start streaming in background
+    threading.Thread(target=reddit_stream, daemon=True).start()
     # Run Flask server on Render’s required port
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
