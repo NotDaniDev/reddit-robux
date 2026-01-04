@@ -21,7 +21,14 @@ reddit = praw.Reddit(
 subreddit = reddit.subreddit("plsdonategame")
 TARGET_FLAIRS = {"Free Giveaway", "Requirement Giveaway"}
 
+# --- Track sent posts to avoid duplicates ---
+sent_posts = set()
+
 def send_to_discord(submission):
+    if submission.id in sent_posts:
+        return
+    sent_posts.add(submission.id)
+
     post_url = f"https://reddit.com{submission.permalink}"
     ping = f"<@{DISCORD_PING_USER_ID}> " if DISCORD_PING_USER_ID else ""
     data = {"content": f"{ping}🎉 New giveaway!\n**{submission.title}**\n{post_url}"}
@@ -29,12 +36,14 @@ def send_to_discord(submission):
     print("Sent:", submission.title, "| Discord response:", r.status_code)
 
 def catch_recent_posts():
-    """Check subreddit for posts in the last 24h with target flair."""
+    """Backfill posts from the last 24 hours with target flair."""
     print("Checking for posts from the last 24 hours...")
     cutoff = datetime.now(timezone.utc) - timedelta(days=1)
-    for submission in subreddit.new(limit=50):  # look at latest 50
+    for submission in subreddit.new(limit=None):  # fetch all available
         created = datetime.fromtimestamp(submission.created_utc, tz=timezone.utc)
-        if created > cutoff and submission.link_flair_text in TARGET_FLAIRS:
+        if created < cutoff:
+            break  # stop once posts are older than 24h
+        if submission.link_flair_text in TARGET_FLAIRS:
             send_to_discord(submission)
 
 def reddit_stream():
