@@ -1,5 +1,6 @@
 import os
 import threading
+import time
 import requests
 import praw
 from flask import Flask
@@ -27,31 +28,42 @@ sent_posts = set()
 def send_to_discord(submission):
     if submission.id in sent_posts:
         return
-    sent_posts.add(submission.id)
-
     post_url = f"https://reddit.com{submission.permalink}"
     ping = f"<@{DISCORD_PING_USER_ID}> " if DISCORD_PING_USER_ID else ""
     data = {"content": f"{ping}🎉 New giveaway!\n**{submission.title}**\n{post_url}"}
-    r = requests.post(DISCORD_WEBHOOK_URL, json=data)
-    print("Sent:", submission.title, "| Discord response:", r.status_code)
+    try:
+        r = requests.post(DISCORD_WEBHOOK_URL, json=data)
+        print("Sent:", submission.title, "| Discord response:", r.status_code)
+        if r.status_code == 204:
+            sent_posts.add(submission.id)
+    except Exception as e:
+        print("Error sending to Discord:", e)
 
 def catch_recent_posts():
     """Backfill posts from the last 24 hours with target flair."""
     print("Checking for posts from the last 24 hours...")
     cutoff = datetime.now(timezone.utc) - timedelta(days=1)
-    for submission in subreddit.new(limit=None):  # fetch all available
+    for submission in subreddit.new(limit=200):  # scan more posts
         created = datetime.fromtimestamp(submission.created_utc, tz=timezone.utc)
-        if created < cutoff:
-            break  # stop once posts are older than 24h
-        if submission.link_flair_text in TARGET_FLAIRS:
-            send_to_discord(submission)
+        print("Saw post:", submission.title, "| Flair:", submission.link_flair_text, "| Created:", created)
+        if created >= cutoff:
+            flair = submission.link_flair_text
+            if flair and flair.strip().lower() in {f.lower() for f in TARGET_FLAIRS}:
+                send_to_discord(submission)
 
 def reddit_stream():
-    """Stream new posts continuously."""
+    """Stream new posts continuously with retry loop."""
     print("Streaming new posts...")
-    for submission in subreddit.stream.submissions(skip_existing=True):
-        if submission.link_flair_text in TARGET_FLAIRS:
-            send_to_discord(submission)
+    while True:
+        try:
+            for submission in subreddit.stream.submissions(skip_existing=True):
+                print("Saw post:", submission.title, "| Flair:", submission.link_flair_text)
+                flair = submission.link_flair_text
+                if flair and flair.strip().lower() in {f.lower() for f in TARGET_FLAIRS}:
+                    send_to_discord(submission)
+        except Exception as e:
+            print("Stream error:", e)
+            time.sleep(10)  # wait before retrying
 
 # --- Flask app to keep Render alive ---
 app = Flask(__name__)
