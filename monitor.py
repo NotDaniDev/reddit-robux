@@ -1,3 +1,4 @@
+# main.py
 import os
 import threading
 import time
@@ -8,24 +9,27 @@ from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 
-# --- Config ---
+# --- Configurable settings ---
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "4"))
-DISCORD_TIMEOUT = float(os.getenv("DISCORD_TIMEOUT", "6"))  # seconds
-BACKFILL_LIMIT = int(os.getenv("BACKFILL_LIMIT", "500"))  # how many posts to scan on startup
-SUBREDDITS = ["plsdonategame", "FreeRobloxAccounts2"]  # add more here if needed
+DISCORD_TIMEOUT = float(os.getenv("DISCORD_TIMEOUT", "6"))  # seconds for webhook requests
+BACKFILL_LIMIT = int(os.getenv("BACKFILL_LIMIT", "500"))   # how many posts to scan on startup per subreddit
+RESCAN_INTERVAL_SECONDS = int(os.getenv("RESCAN_INTERVAL_SECONDS", "300"))  # rescan every 5 minutes
+RESCAN_WINDOW_HOURS = int(os.getenv("RESCAN_WINDOW_HOURS", "24"))  # how far back rescan looks
+RESCAN_LIMIT = int(os.getenv("RESCAN_LIMIT", "500"))  # how many posts to scan per rescan per subreddit
 
-# --- Per-subreddit flair targets ---
+# --- Subreddits and flair mapping ---
+SUBREDDITS = ["plsdonategame", "FreeRobloxAccounts2"]
 FLAIR_MAP = {
     "plsdonategame": {"Free Giveaway", "Requirement Giveaway"},
     "FreeRobloxAccounts2": {"Free Account", "Account Giveaway"}
 }
 
-# --- Load environment variables ---
+# --- Environment variables (set these in Render or .env for local dev) ---
 REDDIT_CLIENT_ID = os.getenv("REDDIT_CLIENT_ID")
 REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET")
 REDDIT_USER_AGENT = os.getenv("REDDIT_USER_AGENT")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
-DISCORD_PING_USER_ID = os.getenv("DISCORD_PING_USER_ID")
+DISCORD_PING_USER_ID = os.getenv("DISCORD_PING_USER_ID")  # optional
 
 # --- Reddit setup ---
 reddit = praw.Reddit(
@@ -34,7 +38,6 @@ reddit = praw.Reddit(
     user_agent=REDDIT_USER_AGENT
 )
 
-# Create subreddit objects for backfill; stream will use combined name
 subreddit_objs = {name: reddit.subreddit(name) for name in SUBREDDITS}
 combined_subreddits = "+".join(SUBREDDITS)
 
@@ -46,7 +49,8 @@ sent_lock = Lock()
 executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
 def log(msg):
-    print(f"[{datetime.now(timezone.utc).astimezone().isoformat()}] {msg}")
+    ts = datetime.now(timezone.utc).astimezone().isoformat()
+    print(f"[{ts}] {msg}")
 
 def send_webhook_payload(payload):
     """Send to Discord with basic 429 handling and timeout."""
@@ -93,10 +97,9 @@ def matches_target_flair(submission):
     if not flair:
         return False
     flair_norm = flair.strip().lower()
-    sub_name = submission.subreddit.display_name  # exact subreddit name
+    sub_name = submission.subreddit.display_name
     target_set = FLAIR_MAP.get(sub_name)
     if not target_set:
-        # fallback: check all flair sets if subreddit not explicitly listed
         combined = set().union(*FLAIR_MAP.values())
         return flair_norm in combined
     return flair_norm in target_set
@@ -132,6 +135,33 @@ def reddit_stream():
             log(f"Stream error: {e}. Restarting stream in 5s.")
             time.sleep(5)
 
+def periodic_rescan():
+    """Periodically scan recent posts to catch flair changes applied after creation."""
+    log(f"Starting periodic rescan every {RESCAN_INTERVAL_SECONDS}s for last {RESCAN_WINDOW_HOURS}h")
+    while True:
+        try:
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=RESCAN_WINDOW_HOURS)
+            for name, sub in subreddit_objs.items():
+                checked = 0
+                log(f"[rescan] scanning subreddit: {name}")
+                for submission in sub.new(limit=RESCAN_LIMIT):
+                    checked += 1
+                    created = datetime.fromtimestamp(submission.created_utc, tz=timezone.utc)
+                    if created < cutoff:
+                        break
+                    with sent_lock:
+                        already = submission.id in sent_posts
+                    if already:
+                        continue
+                    log(f"[rescan][{name}] saw: {submission.id} | flair={submission.link_flair_text} | created={created.isoformat()} | title={submission.title}")
+                    if matches_target_flair(submission):
+                        log(f"[rescan] scheduling send for {submission.id} (flair matched on rescan)")
+                        schedule_send(submission)
+                log(f"[rescan][{name}] checked {checked} posts")
+        except Exception as e:
+            log(f"Rescan error: {e}")
+        time.sleep(RESCAN_INTERVAL_SECONDS)
+
 # --- Flask app to keep Render alive ---
 app = Flask(__name__)
 
@@ -140,8 +170,9 @@ def home():
     return "Bot is running!"
 
 if __name__ == "__main__":
-    # Optionally load persisted sent_posts here (not included)
+    # Optional: load persisted sent_posts from disk here if you add persistence
     catch_recent_posts()
     threading.Thread(target=reddit_stream, daemon=True).start()
+    threading.Thread(target=periodic_rescan, daemon=True).start()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
